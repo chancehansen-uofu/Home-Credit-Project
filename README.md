@@ -21,7 +21,7 @@ Chance Hansen
 | File | Description |
 |---|---|
 | `feature_engineering.R` | Reusable data cleaning and feature engineering pipeline |
-| `IS6850_modeling.qmd` | Modeling notebook: candidate models, tuning, and Kaggle submission |
+| `Modeling_HansenChance.qmd` | Modeling notebook: candidate models, tuning, and Kaggle submission |
 | `submission.csv` | Kaggle submission file with predicted default probabilities |
 
 ---
