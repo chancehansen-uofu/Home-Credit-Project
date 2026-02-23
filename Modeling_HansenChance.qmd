@@ -1,0 +1,461 @@
+---
+title: "IS 6850: Modeling – Home Credit Default Risk"
+author: "Chance Hansen"
+date: "February 21, 2026"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    embed-resources: true
+execute:
+  include: true
+  eval: true    
+  warning: false
+  message: false
+---
+
+## Introduction
+
+### Business Problem
+
+Home Credit serves borrowers who lack conventional credit histories, making traditional risk scoring unreliable. Without accurate default prediction, the company faces two costly errors: approving loans to applicants who will default, and rejecting applicants who would have repaid. The goal is to build a model that estimates each applicant's probability of default, enabling loan officers to make better-informed approval decisions and to price loans appropriately for risk.
+
+### Analytic Problem
+
+The core modeling challenge is binary classification: predicting whether a given applicant will default (`TARGET = 1`) or repay (`TARGET = 0`). The dataset is highly imbalanced, only about 8% of applicants default, which means naive accuracy is a misleading metric and standard models tend to underpredict the minority class. Performance is measured using the area under the ROC curve (AUC), which evaluates a model's ability to rank defaulters above non-defaulters regardless of classification threshold.
+
+### Notebook Purpose
+
+This notebook documents the full modeling pipeline: establishing a performance benchmark, engineering features from multiple supplementary tables, comparing candidate models using cross-validation, addressing class imbalance, tuning hyperparameters, and generating a Kaggle submission. All feature engineering is encapsulated in `feature_engineering.R` for reusability and to ensure consistent train/test handling.
+
+```{r}
+#| label: setup
+library(data.table)
+library(dplyr)
+library(tidymodels)
+library(themis)
+library(xgboost)
+library(randomForest)
+library(caret)
+library(dials)
+library(pROC)
+
+source("feature_engineering.R")
+```
+
+---
+
+## Data Preparation
+
+### Loading Data
+
+We load the main application table and five supplementary datasets. Each supplementary table contains transactional or historical records at a finer grain than the application and must be aggregated to the applicant level before joining.
+
+```{r}
+#| label: load-data
+train_df        <- fread("application_train.csv")
+test_df         <- fread("application_test.csv")
+bureau_df       <- fread("bureau.csv")
+prev_app_df     <- fread("previous_application.csv")
+installments_df <- fread("installments_payments.csv")
+cc_df           <- fread("credit_card_balance.csv")
+pos_df          <- fread("POS_CASH_balance.csv")
+```
+
+### Feature Engineering
+
+All feature engineering is handled by `prepare_data()` in `feature_engineering.R`. Training-set statistics (medians, min/max values, quantile thresholds) are computed on the training data and passed to the test set to prevent data leakage. The pipeline applies the following transformations:
+
+**Anomaly correction:** `DAYS_EMPLOYED` contains the sentinel value 365,243 for pensioners, which is replaced with `NA` before converting to `EMPLOYED_YEARS`.
+
+**Time variables:** Negative day offsets (`DAYS_BIRTH`, `DAYS_REGISTRATION`, `DAYS_ID_PUBLISH`) are converted to positive years for interpretability.
+
+**Missing value indicators:** Binary flags are created for `OWN_CAR_AGE`, `AMT_GOODS_PRICE`, and the three `EXT_SOURCE` variables before imputing with training-set medians. Flagging missingness separately allows the model to learn whether the absence of information is itself predictive.
+
+**Financial ratios:** Key credit risk signals are derived, income-to-credit ratio, annuity-to-income (debt-to-income / DTI), loan-to-value (LTV), credit-to-annuity, and income per family member.
+
+**Interaction features:** Products of age × income, income × annuity, and credit × age capture multiplicative effects that linear models would otherwise miss.
+
+**Normalization and binning:** `REGION_POPULATION_RELATIVE` and the `EXT_SOURCE` columns are min-max scaled using training statistics. `AGE_YEARS` and `EXT_SOURCE` columns are also quantile-binned into 5 groups to expose non-linear patterns to linear models.
+
+**Supplementary aggregations:** Each external table is reduced to one row per applicant:
+
+- *Bureau:* credit count, active/closed counts, total debt, overdue amounts, and debt ratio
+- *Previous applications:* approval rate, mean requested and granted amounts
+- *Installments:* late payment rate and total overpayment amount
+- *Credit card:* total balance, total drawings, and credit utilization ratio
+- *POS cash:* installment count, remaining installments, and days-past-due rate
+
+```{r}
+#| label: prepare-data
+# Build train features and capture training-set statistics
+train_result <- prepare_data(
+  app_df          = train_df,
+  bureau_df       = bureau_df,
+  prev_app_df     = prev_app_df,
+  installments_df = installments_df,
+  cc_df           = cc_df,
+  pos_df          = pos_df
+)
+train_clean <- train_result$df
+train_stats <- train_result$train_stats
+
+# Build test features using training-set statistics to avoid leakage
+test_result <- prepare_data(
+  app_df          = test_df,
+  train_stats     = train_stats,
+  bureau_df       = bureau_df,
+  prev_app_df     = prev_app_df,
+  installments_df = installments_df,
+  cc_df           = cc_df,
+  pos_df          = pos_df
+)
+test_clean <- test_result$df
+
+# Preserve test IDs for submission, then drop from both sets
+test_ids    <- test_clean$SK_ID_CURR
+train_clean <- train_clean %>% select(-SK_ID_CURR)
+test_clean  <- test_clean  %>% select(-SK_ID_CURR)
+```
+
+### Baseline Model
+
+Before building any predictive model we establish a naive benchmark: predicting the majority class (no default) for every applicant. This gives 91.9% accuracy but a 0.50 AUC, confirming that accuracy alone is a misleading metric and that the model has no discriminating power without actually learning from the data.
+
+```{r}
+#| label: baseline
+baseline_pred     <- rep(0, nrow(train_clean))
+baseline_accuracy <- mean(train_clean$TARGET == baseline_pred)
+baseline_auc      <- pROC::auc(train_clean$TARGET, baseline_pred)
+
+cat("Baseline accuracy:", round(baseline_accuracy, 4), "\n")
+cat("Baseline AUC:", round(baseline_auc, 4), "\n")
+```
+
+### Cleaning and Subsampling
+
+We convert `TARGET` to a factor, replace remaining infinite values and NAs with 0, convert character columns to factors, and remove near-zero-variance predictors. We then draw a stratified 5000 row subsample to use during model comparison and tuning, keeping computation manageable while preserving class proportions.
+
+```{r}
+#| label: clean-data
+train_clean <- data.table::as.data.table(train_clean)
+test_clean  <- data.table::as.data.table(test_clean)
+
+train_clean[, TARGET := factor(ifelse(TARGET == 1, "Yes", "No"))]
+
+replace_bad <- function(x) { x[is.infinite(x)] <- NA; x[is.na(x)] <- 0; x }
+
+num_cols <- names(train_clean)[vapply(train_clean, is.numeric, logical(1))]
+train_clean[, (num_cols) := lapply(.SD, replace_bad), .SDcols = num_cols]
+
+num_cols_test <- intersect(num_cols, names(test_clean))
+test_clean[, (num_cols_test) := lapply(.SD, replace_bad), .SDcols = num_cols_test]
+
+char_cols <- names(train_clean)[vapply(train_clean, is.character, logical(1))]
+train_clean[, (char_cols) := lapply(.SD, as.factor), .SDcols = char_cols]
+
+char_cols_test <- names(test_clean)[vapply(test_clean, is.character, logical(1))]
+test_clean[, (char_cols_test) := lapply(.SD, as.factor), .SDcols = char_cols_test]
+
+nzv_idx <- caret::nearZeroVar(train_clean)
+if (length(nzv_idx) > 0) {
+  train_clean[, (names(train_clean)[nzv_idx]) := NULL]
+}
+
+set.seed(42)
+train_small <- train_clean[sample(.N, min(5000, .N))]
+```
+
+---
+
+## Modeling Process
+
+### Strategy Overview
+
+Model selection follows a deliberate stepwise process to isolate the contribution of each decision:
+
+1. Establish the majority-class AUC floor (0.50).
+2. Compare logistic regression on application-only features versus the full engineered feature set, to quantify the lift from supplementary data.
+3. Compare three algorithm families (logistic regression, random forest, and XGBoost) on the full feature set using 3-fold CV AUC.
+4. Test SMOTE oversampling on both logistic regression and XGBoost to evaluate whether correcting class imbalance improves AUC.
+5. Tune the best-performing model (XGBoost) using a space-filling randomized search across 20 hyperparameter combinations on the 5000 row subsample.
+6. Refit the tuned model on the full 307,511-row training set for submission.
+
+All cross-validation uses 3 folds to keep runtimes tractable while still providing a reliable out-of-sample estimate.
+
+### Cross-Validation and Recipe Setup
+
+```{r}
+#| label: cv-setup
+cv_folds <- vfold_cv(train_small, v = 3, strata = TARGET)
+```
+
+All tidymodels workflows share the same base recipe: dummy-encode nominal predictors, remove zero-variance columns, and standardize numeric predictors. Standardization is necessary for logistic regression convergence and does not harm tree-based models.
+
+```{r}
+#| label: base-recipe
+base_recipe <- recipe(TARGET ~ ., data = train_small) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+### Candidate Model 1: Logistic Regression (Application Features Only)
+
+As a reference point we train logistic regression using only the raw `application_train.csv` columns, before any supplementary joins. This lets us isolate the value added by the feature engineering step.
+
+```{r}
+#| label: log-app-only
+cv_control <- trainControl(
+  method = "cv", number = 3,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE, savePredictions = TRUE
+)
+
+app_only <- as.data.frame(train_df)
+app_only$TARGET <- factor(ifelse(app_only$TARGET == 1, "Yes", "No"))
+app_only$SK_ID_CURR <- NULL
+
+num_app_cols <- names(app_only)[vapply(app_only, is.numeric, logical(1))]
+for (col in num_app_cols) {
+  app_only[[col]][is.infinite(app_only[[col]])] <- NA
+  app_only[[col]][is.na(app_only[[col]])]       <- 0
+}
+chr_app_cols <- names(app_only)[vapply(app_only, is.character, logical(1))]
+for (col in chr_app_cols) app_only[[col]] <- as.factor(app_only[[col]])
+
+set.seed(42)
+app_small <- app_only[sample(nrow(app_only), 5000), ]
+
+log_app_only <- train(
+  TARGET ~ ., data = app_small, method = "glm",
+  family = "binomial", trControl = cv_control, metric = "ROC"
+)
+
+log_app_only_auc <- mean(log_app_only$results$ROC)
+cat("Logistic (app-only) CV AUC:", round(log_app_only_auc, 4), "\n")
+```
+
+### Candidate Model 2: Logistic Regression (Full Feature Set)
+
+Adding the engineered features from all supplementary tables should improve over the app-only result. Logistic regression also serves as the linear baseline for comparing against non-linear algorithms.
+
+```{r}
+#| label: logistic
+log_model <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+log_wflow <- workflow() %>%
+  add_model(log_model) %>%
+  add_recipe(base_recipe)
+
+log_res <- fit_resamples(log_wflow, resamples = cv_folds,
+                         metrics = metric_set(roc_auc))
+collect_metrics(log_res)
+```
+
+### Candidate Model 3: Random Forest
+
+Random forest builds an ensemble of decorrelated decision trees and is robust to hyperparameter choices, making it a strong non-linear baseline before committing to more expensive tuning on another algorithm.
+
+```{r}
+#| label: random-forest
+rf_model <- rand_forest(trees = 100, mtry = 5) %>%
+  set_engine("randomForest") %>%
+  set_mode("classification")
+
+rf_wflow <- workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(base_recipe)
+
+rf_res <- fit_resamples(rf_wflow, resamples = cv_folds,
+                        metrics = metric_set(roc_auc))
+collect_metrics(rf_res)
+```
+
+### Candidate Model 4: XGBoost (Base Configuration)
+
+XGBoost is evaluated first with fixed, sensible defaults (200 trees, depth 4, learning rate 0.05) to establish its untuned AUC before hyperparameter search. It handles missing values natively, models complex interactions through boosted trees, and typically outperforms random forest on structured tabular data.
+
+```{r}
+#| label: xgboost-base
+xgb_model_base <- boost_tree(trees = 200, tree_depth = 4, learn_rate = 0.05) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_wflow_base <- workflow() %>%
+  add_model(xgb_model_base) %>%
+  add_recipe(base_recipe)
+
+xgb_res <- fit_resamples(xgb_wflow_base, resamples = cv_folds,
+                         metrics = metric_set(roc_auc))
+collect_metrics(xgb_res)
+```
+
+### Addressing Class Imbalance: SMOTE
+
+With only ~8% of applicants defaulting, models can learn to ignore the minority class. SMOTE (Synthetic Minority Over-sampling Technique) generates synthetic minority-class observations during training by interpolating between existing minority examples. We test it on both logistic regression and XGBoost and compare against non-SMOTE results.
+
+```{r}
+#| label: smote
+smote_recipe <- base_recipe %>% step_smote(TARGET)
+
+log_smote_res <- fit_resamples(
+  workflow() %>% add_model(log_model) %>% add_recipe(smote_recipe),
+  resamples = cv_folds, metrics = metric_set(roc_auc)
+)
+
+xgb_smote_res <- fit_resamples(
+  workflow() %>% add_model(xgb_model_base) %>% add_recipe(smote_recipe),
+  resamples = cv_folds, metrics = metric_set(roc_auc)
+)
+
+cat("Logistic + SMOTE CV AUC:\n"); print(collect_metrics(log_smote_res))
+cat("\nXGBoost + SMOTE CV AUC:\n"); print(collect_metrics(xgb_smote_res))
+```
+
+### Model Comparison Summary
+
+```{r}
+#| label: model-comparison
+pull_auc <- function(res) {
+  collect_metrics(res) %>% filter(.metric == "roc_auc") %>% pull(mean)
+}
+
+model_results <- data.frame(
+  Model = c("Logistic (app-only)", "Logistic (full features)",
+            "Logistic + SMOTE", "Random Forest",
+            "XGBoost (base)", "XGBoost + SMOTE"),
+  CV_AUC = round(c(
+    log_app_only_auc,
+    pull_auc(log_res),
+    pull_auc(log_smote_res),
+    pull_auc(rf_res),
+    pull_auc(xgb_res),
+    pull_auc(xgb_smote_res)
+  ), 4)
+)
+
+model_results[order(-model_results$CV_AUC), ]
+```
+
+Three conclusions stand out. First, supplementary features add meaningful lift: the full-feature logistic model (AUC 0.675) outperforms the app-only version (AUC 0.633), confirming that bureau history, prior applications, and payment behavior carry real predictive signal. Second, XGBoost leads all models at 0.714 AUC, outperforming both logistic regression and random forest. Third, SMOTE hurt AUC in both cases (logistic dropped from 0.675 to 0.658 and XGBoost from 0.714 to 0.708) so we proceed without it.
+
+### Hyperparameter Tuning
+
+We tune XGBoost using a space-filling grid of 20 parameter combinations across five hyperparameters: number of trees, tree depth, learning rate, minimum loss reduction, and row sampling proportion. Space-filling search ensures broad, non-redundant coverage of the parameter space at a fraction of the cost of exhaustive grid search. All tuning is performed on the 5000 row subsample with 3-fold CV.
+
+```{r}
+#| label: tuning
+xgb_tune_model <- boost_tree(
+  trees = tune(), tree_depth = tune(), learn_rate = tune(),
+  loss_reduction = tune(), sample_size = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_tune_wflow <- workflow() %>%
+  add_model(xgb_tune_model) %>%
+  add_recipe(base_recipe)
+
+xgb_grid <- grid_space_filling(
+  trees(range = c(100L, 400L)),
+  tree_depth(range = c(3L, 7L)),
+  learn_rate(range = c(-2, -0.7), trans = log10_trans()),
+  loss_reduction(range = c(0, 5)),
+  sample_prop(range = c(0.6, 1.0)),
+  size = 20
+)
+
+set.seed(42)
+xgb_tune <- tune_grid(
+  xgb_tune_wflow, resamples = cv_folds,
+  grid = xgb_grid, metrics = metric_set(roc_auc)
+)
+
+show_best(xgb_tune, metric = "roc_auc", n = 5)
+```
+
+---
+
+## Model Performance
+
+### Final Model Training
+
+The best hyperparameter combination is selected by CV AUC and used to finalize the workflow. The final model is retrained on the full 307,511-row training set (not the 5000 row subsample used during tuning) to maximize the information available to the model before submission.
+
+```{r}
+#| label: final-model
+best_params <- select_best(xgb_tune, metric = "roc_auc")
+
+xgb_final_wflow <- finalize_workflow(xgb_tune_wflow, best_params)
+
+final_fit <- fit(xgb_final_wflow, data = train_clean)
+
+cat("Final model trained on", nrow(train_clean), "rows.\n")
+cat("Best hyperparameters:\n")
+print(best_params)
+```
+
+### Performance Summary
+
+| Metric | Value |
+|---|---|
+| Majority-class baseline AUC | 0.500 |
+| Logistic regression (app-only) CV AUC | 0.633 |
+| Logistic regression (full features) CV AUC | 0.675 |
+| Random Forest CV AUC | 0.667 |
+| XGBoost base CV AUC | 0.714 |
+| **XGBoost tuned CV AUC** | **~0.720** |
+| **Kaggle public leaderboard AUC** | **0.73592** |
+
+The tuned XGBoost generalizes cleanly: the Kaggle score (0.736) is consistent with and slightly above the cross-validation estimates from the subsample, with no sign of overfitting. The small upward gap reflects the benefit of retraining on the full dataset, 60× more data meaningfully improved generalization.
+
+**Runtime:** Hyperparameter tuning (20 combinations × 3 folds) completed in approximately 10–15 minutes on the 5,000-row subsample. Final model training on the full 307,511 rows required an additional 5–10 minutes. Using the subsample exclusively for tuning kept total runtime under 30 minutes while preserving full training data for the final fit.
+
+---
+
+## Results
+
+### Summary of Findings
+
+XGBoost trained on a rich feature set (combining application data with bureau history, prior application outcomes, installment payment patterns, credit card utilization, and POS cash balances) achieved a Kaggle AUC of **0.736**, a substantial improvement over the 0.500 majority-class baseline.
+
+Feature engineering was the single largest contributor to performance. Adding the supplementary tables raised logistic regression AUC by 4.2 points (0.633 to 0.675). XGBoost then added a further 4 points (0.675 to 0.714) by capturing non-linear interactions that a linear model cannot express. Hyperparameter tuning and full-data retraining produced the final AUC of 0.736.
+
+SMOTE did not improve AUC and was excluded from the final pipeline. XGBoost is well-suited to handle imbalanced data without resampling, as boosting naturally focuses successive trees on harder-to-classify minority examples.
+
+### Business Implications
+
+A model with AUC of 0.736 means that in approximately 74% of head-to-head comparisons, the model correctly ranks a true defaulter as riskier than a true non-defaulter. For Home Credit, this translates into three practical applications:
+
+**Loan approval decisions:** Applications can be scored against a probability threshold calibrated to the company's risk tolerance. Raising the threshold approves fewer but safer loans; lowering it expands the portfolio at higher risk. The model gives loan officers a principled starting point for either direction.
+
+**Risk-based pricing:** Predicted default probabilities can directly inform interest rate setting, with higher-risk applicants offered loans at higher rates. This makes the portfolio economically self-sustaining without requiring blanket rejection of borderline applicants.
+
+**Prioritized manual review:** Applications near the decision boundary can be flagged for underwriter review, concentrating human attention where the model is least certain and where expert judgment adds the most value.
+
+The most predictive features (based on domain knowledge and model structure) are the `EXT_SOURCE` credit bureau scores, payment-to-income ratios, bureau debt levels, and late installment payment rates. These directly reflect an applicant's historical repayment behavior, aligning with how experienced loan officers assess creditworthiness and lending interpretability to the model's outputs.
+
+---
+
+## Kaggle Submission
+
+```{r}
+test_preds <- predict(final_fit, test_clean, type = "prob")$.pred_Yes
+
+submission <- data.frame(
+  SK_ID_CURR = test_ids,
+  TARGET     = test_preds
+)
+
+fwrite(submission, "submission.csv")
+
+cat("Submission written: submission.csv\n")
+cat("Test set rows:", nrow(submission), "\n")
+cat("Predicted probability range:", round(range(test_preds), 4), "\n")
+cat("Kaggle public leaderboard AUC: 0.73592\n")
+```

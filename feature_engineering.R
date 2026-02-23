@@ -30,7 +30,17 @@ normalize_col <- function(x, train_stats = NULL, col_name = NULL) {
 
 # Create bins (quantiles) using training thresholds
 bin_col <- function(x, thresholds) {
-  return(as.integer(cut(x, breaks = c(-Inf, thresholds, Inf), include.lowest = TRUE)))
+  breaks <- c(-Inf, thresholds, Inf)
+  breaks <- unique(breaks)
+  if (length(breaks) <= 2) {
+    return(rep(NA, length(x)))
+  }
+  cut(
+    x,
+    breaks = breaks,
+    include.lowest = TRUE,
+    labels = FALSE
+  )
 }
 
 # Convert days to numeric
@@ -131,15 +141,15 @@ process_application <- function(app_df, train_stats = NULL, n_bins = 5) {
   # ------------------------
   cat_cols <- c("CODE_GENDER", "NAME_INCOME_TYPE", "NAME_EDUCATION_TYPE",
                 "NAME_FAMILY_STATUS", "NAME_HOUSING_TYPE", "OCCUPATION_TYPE")
-  df[cat_cols] <- lapply(df[cat_cols], factor)
+  df[, (cat_cols) := lapply(.SD, factor), .SDcols = cat_cols]
   
   # ------------------------
   # Normalize numeric columns
   # ------------------------
   norm_cols <- c("REGION_POPULATION_RELATIVE", ext_sources)
   if (is.null(train_stats)) {
-    min_vals <- sapply(df[norm_cols], min, na.rm = TRUE)
-    max_vals <- sapply(df[norm_cols], max, na.rm = TRUE)
+    min_vals <- sapply(df[, ..norm_cols], min, na.rm = TRUE)
+    max_vals <- sapply(df[, ..norm_cols], max, na.rm = TRUE)
   } else {
     min_vals <- train_stats$min[norm_cols]
     max_vals <- train_stats$max[norm_cols]
@@ -153,22 +163,29 @@ process_application <- function(app_df, train_stats = NULL, n_bins = 5) {
   # Quantile Binning
   # ------------------------
   bin_cols <- c("AGE_YEARS", ext_sources)
+
   if (is.null(train_stats)) {
-    thresholds <- lapply(df[bin_cols], function(x) quantile(x, probs = seq(0,1,length.out=n_bins+1)[-c(1,n_bins+1)], na.rm = TRUE))
+  thresholds <- lapply(df[, ..bin_cols], function(x) {
+    quantile(
+      x,
+      probs = seq(0, 1, length.out = n_bins + 1)[-c(1, n_bins + 1)],
+      na.rm = TRUE
+    )
+  })
   } else {
-    thresholds <- train_stats$bin_thresholds
-  }
-  
-  for (col in bin_cols) {
-    df[[paste0(col,"_BIN")]] <- bin_col(df[[col]], thresholds[[col]])
-  }
+  thresholds <- train_stats$bin_thresholds
+}
+
+for (col in bin_cols) {
+  df[[paste0(col, "_BIN")]] <- bin_col(df[[col]], thresholds[[col]])
+}
   
   # ------------------------
   # Save train stats
   # ------------------------
   if (is.null(train_stats)) {
     train_stats <- list(
-      median = sapply(df[ext_sources], median, na.rm = TRUE),
+      median = sapply(df[, ..ext_sources], median, na.rm = TRUE),
       min = min_vals,
       max = max_vals,
       bin_thresholds = thresholds
@@ -210,22 +227,18 @@ aggregate_bureau <- function(bureau_df) {
 # Previous Applications Aggregation
 # --------------------------
 aggregate_prev_app <- function(prev_df) {
-  prev_df <- prev_df %>%
-    mutate_at(vars(DAYS_DECISION:DAYS_TERMINATION, DAYS_FIRST_DRAWING:DAYS_LAST_DUE),
-              time_relative)
   
-  prev_agg <- prev_df %>%
+  prev_df %>%
     group_by(SK_ID_CURR) %>%
     summarise(
       PREV_COUNT = n(),
-      PREV_APPROVED = sum(STATUS %in% c("Approved","XNA")),
-      PREV_REFUSED = sum(!(STATUS %in% c("Approved","XNA"))),
-      PREV_AMT_CREDIT_SUM = sum(AMT_CREDIT, na.rm = TRUE),
-      PREV_AMT_ANNUITY_SUM = sum(AMT_ANNUITY, na.rm = TRUE),
-      PREV_APPROVAL_RATE = PREV_APPROVED / PREV_COUNT
+      PREV_APPROVED = sum(NAME_CONTRACT_STATUS == "Approved", na.rm = TRUE),
+      PREV_REFUSED = sum(NAME_CONTRACT_STATUS == "Refused", na.rm = TRUE),
+      PREV_APPROVAL_RATE = PREV_APPROVED / PREV_COUNT,
+      PREV_AMT_CREDIT_MEAN = mean(AMT_CREDIT, na.rm = TRUE),
+      PREV_AMT_APPLICATION_MEAN = mean(AMT_APPLICATION, na.rm = TRUE),
+      .groups = "drop"
     )
-  
-  return(prev_agg)
 }
 
 # --------------------------
@@ -277,7 +290,7 @@ aggregate_cc <- function(cc_df) {
     summarise(
       CC_BALANCE_TOTAL = sum(AMT_BALANCE, na.rm = TRUE),
       CC_DRAWINGS_TOTAL = sum(AMT_DRAWINGS_CURRENT, na.rm = TRUE),
-      CC_UTILIZATION = sum(AMT_BALANCE, na.rm = TRUE)/sum(AMT_CREDIT_LIMIT_ACTUAL, na.rm = 1)
+      CC_UTILIZATION = sum(AMT_BALANCE, na.rm = TRUE)/sum(AMT_CREDIT_LIMIT_ACTUAL, na.rm = TRUE)
     )
   
   return(cc_agg)
