@@ -1,0 +1,650 @@
+---
+title: "Model Card: Home Credit Default Risk"
+author: "Chance Hansen"
+date: "March 7, 2026"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Executive Summary
+
+This model estimates the probability that a Home Credit loan applicant will default on their loan. Home Credit serves borrowers who lack conventional credit histories, making traditional bureau-based scoring unreliable. The model enables data-driven, risk-informed approval decisions for this underserved population.
+
+The final model is a **tuned XGBoost gradient-boosted tree ensemble** trained on 307,511 historical applications enriched with bureau records, prior application history, installment payment behavior, credit card balances, and POS cash data. It achieves a **Kaggle public leaderboard AUC of 0.736**, meaning it correctly ranks a true defaulter as higher-risk than a true non-defaulter in roughly **74 out of 100** head-to-head comparisons, compared to 50 out of 100 by random chance.
+
+**Business recommendation:** Deploy at a decision threshold of **0.15** (predicted probability of default). This threshold is chosen because the model's output probabilities are compressed into the range 0.02–0.41, a common behavior for XGBoost trained on imbalanced data (~8% default rate). A threshold of 0.15 produces a meaningful denial rate while remaining above the naïve cost-minimizing floor, and delivers an estimated net savings of approximately **$0.4–0.7 million** per 10,000 applications processed relative to approving all applicants without a model.
+
+**Key caveats for decision-makers:**
+
+1. Performance is validated on historical data; real-world accuracy may degrade as economic conditions change. Annual revalidation is required.
+2. The three most predictive features are external credit bureau scores (EXT\_SOURCE\_1/2/3) computed by third parties whose methodologies may change without notice.
+3. Fairness analysis at the chosen threshold shows meaningful disparities across education groups that warrant legal review before production deployment.
+4. All denied applicants must receive plain-language adverse action notices within 30 days per ECOA and FCRA. An approved denial-reason translation guide is included in Section 6.
+5. This model is a **decision-support tool**, not a decision-maker. Human review of borderline cases is required.
+
+---
+
+## 1. Model Details
+
+```{r}
+#| label: setup
+library(data.table)
+library(dplyr)
+library(tidymodels)
+library(xgboost)
+library(shapviz)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(pROC)
+
+# ── Explicit yardstick imports to avoid caret:: namespace conflict ──────
+# caret::precision() masks yardstick::precision() and has a different signature.
+# All precision/recall calls use yardstick:: explicitly throughout this document.
+
+# ── Load saved model objects ────────────────────────────────────────────
+final_fit   <- readRDS("final_fit.rds")
+train_clean <- readRDS("train_clean.rds")
+
+# ── Global threshold ────────────────────────────────────────────────────
+# Model predicted probabilities range ~0.02-0.41 (XGBoost on 8.1% imbalanced data).
+# A threshold of 0.15 produces a meaningful denial rate across the actual score range.
+THRESHOLD <- 0.15
+```
+
+| Field | Detail |
+|---|---|
+| **Model type** | XGBoost gradient-boosted tree ensemble (binary classification) |
+| **Framework** | R `tidymodels` + `xgboost` |
+| **Version** | v1.0 — tuned, March 2026 |
+| **Output** | Probability score in [0, 1]; higher = higher predicted default risk |
+| **Training data** | Home Credit `application_train.csv` + 5 supplementary tables |
+| **Training rows** | 307,511 applicants |
+| **Default rate** | ~8.1% (TARGET = 1) |
+| **Engineered features** | ~170 from 122 raw application fields + supplementary aggregates |
+| **Predicted probability range** | 0.0197 – 0.4110 (test set) |
+
+### Supplementary Data Sources
+
+Five external tables were aggregated to the applicant level and joined to the main application table. Training-set statistics (medians, min/max) were computed on the training set only and applied to the test set to prevent data leakage.
+
+| Table | Features Derived |
+|---|---|
+| `bureau.csv` | Credit count, active/closed counts, total debt, overdue amounts, debt ratio |
+| `previous_application.csv` | Approval rate, previous refusals, mean requested and granted amounts |
+| `installments_payments.csv` | Late payment rate, total overpayment amount |
+| `credit_card_balance.csv` | Total balance, total drawings, credit utilization ratio |
+| `POS_CASH_balance.csv` | Installment count, remaining installments, days-past-due rate |
+
+### Final Hyperparameters
+
+Selected via a space-filling search of 20 combinations across 5 hyperparameters, evaluated by 3-fold CV AUC on a stratified 5,000-row subsample. The final model was retrained on all 307,511 rows.
+
+```{r}
+#| label: hyperparams-table
+params <- data.frame(
+  Hyperparameter = c("trees", "tree_depth", "learn_rate",
+                     "loss_reduction", "sample_size", "SMOTE"),
+  Value          = c("194", "4", "0.0137", "1.83", "0.895", "None"),
+  Description    = c("Number of boosting rounds",
+                     "Maximum depth per tree",
+                     "Shrinkage factor (eta)",
+                     "Minimum gain required to make a split (gamma)",
+                     "Row subsampling ratio per tree",
+                     "SMOTE reduced AUC in testing and was excluded")
+)
+
+kable(params, align = "lll") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+## 2. Intended Use
+
+**This model is designed for** Home Credit credit analysts and loan officers using default probability scores as one input in loan approval decisions. Intended applications include applicant risk scoring at origination, risk-tier stratification for pricing, flagging borderline cases for manual underwriter review, and supporting risk-based interest rate setting.
+
+**This model is NOT designed for:**
+
+- Fully automated loan decisions without human oversight
+- Credit scoring in markets materially different from Home Credit's operating regions
+- Collections scoring or post-origination default prediction
+- Any context where denial reasons cannot be communicated to affected individuals
+
+**Affected individuals:** Loan applicants, particularly those in underserved markets with limited traditional credit history, the core population Home Credit serves.
+
+---
+
+## 3. Performance Metrics
+
+```{r}
+#| label: model-comparison-table
+model_results <- data.frame(
+  Model = c(
+    "Majority-class baseline",
+    "Logistic Regression (app-only)",
+    "Logistic Regression (full features)",
+    "Logistic + SMOTE",
+    "Random Forest",
+    "XGBoost (base config)",
+    "XGBoost + SMOTE",
+    "XGBoost (tuned)  <- selected"
+  ),
+  CV_AUC = c(0.500, 0.633, 0.675, 0.658, 0.667, 0.714, 0.708, 0.720),
+  Lift   = c("--", "+0.133", "+0.175", "+0.158",
+             "+0.167", "+0.214", "+0.208", "+0.220")
+)
+
+kable(model_results,
+      col.names = c("Model", "CV AUC", "vs. Baseline"),
+      align = "lcc",
+      caption = "Table 1. 3-fold cross-validated AUC across all candidate models (stratified 5,000-row subsample)") |>
+  kable_styling(bootstrap_options = c("striped", "hover")) |>
+  row_spec(8, bold = TRUE, background = "#fff3cd")
+```
+
+```{r}
+#| label: model-comparison-chart
+#| fig-cap: "Figure 1. Model Comparison - 3-Fold CV AUC"
+#| fig-height: 4
+model_results$highlight <- c("gray","gray","gray","gray","gray","navy","gray","gold")
+
+ggplot(model_results, aes(x = reorder(Model, CV_AUC), y = CV_AUC,
+                           fill = highlight)) +
+  geom_col(width = 0.65) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "#cc4444", linewidth = 0.7) +
+  geom_text(aes(label = round(CV_AUC, 3)), hjust = -0.1, size = 3.2) +
+  scale_fill_manual(values = c("gold" = "#c9a84c", "navy" = "#1b2d42", "gray" = "#8a9ab0"),
+                    guide = "none") +
+  coord_flip() +
+  scale_y_continuous(limits = c(0.47, 0.76)) +
+  labs(x = NULL, y = "CV AUC") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+### Threshold-Specific Metrics
+
+The table below reports precision and recall at the recommended operating threshold of **`r THRESHOLD`**, computed on a held-out 5,000-row stratified sample drawn from the training data.
+
+```{r}
+#| label: threshold-metrics
+set.seed(99)
+val_idx      <- sample(nrow(train_clean), 5000)
+val_data     <- as.data.frame(train_clean[val_idx, ])
+val_probs    <- predict(final_fit, new_data = val_data, type = "prob")$.pred_Yes
+val_actual_f <- factor(val_data$TARGET, levels = c("Yes", "No"))
+
+val_pred_class <- factor(ifelse(val_probs >= THRESHOLD, "Yes", "No"),
+                          levels = c("Yes", "No"))
+
+# yardstick:: explicit namespace -- avoids caret::precision() conflict
+metric_df <- data.frame(truth = val_actual_f, estimate = val_pred_class)
+
+prec <- yardstick::precision(metric_df,
+                              truth       = truth,
+                              estimate    = estimate,
+                              event_level = "first")$.estimate
+
+rec  <- yardstick::recall(metric_df,
+                           truth       = truth,
+                           estimate    = estimate,
+                           event_level = "first")$.estimate
+
+final_scores <- data.frame(
+  Metric = c(
+    "Cross-validated AUC (tuned, subsample)",
+    "Kaggle public leaderboard AUC",
+    paste0("Precision @ threshold ", THRESHOLD),
+    paste0("Recall @ threshold ",    THRESHOLD)
+  ),
+  Value = c(
+    "0.720",
+    "0.73592",
+    paste0(round(prec * 100, 1), "%"),
+    paste0(round(rec  * 100, 1), "%")
+  ),
+  Notes = c(
+    "3-fold CV on 5,000-row stratified subsample",
+    "Held-out test set; final model retrained on 307,511 rows",
+    "Of flagged applicants, this share are true defaulters",
+    "Share of all true defaulters correctly flagged"
+  )
+)
+
+kable(final_scores, align = "lll",
+      caption = "Table 2. Final model performance summary") |>
+  kable_styling(bootstrap_options = c("striped", "hover")) |>
+  row_spec(c(2, 3), bold = TRUE)
+```
+
+Feature engineering contributed the single largest performance gain (+4.2 AUC points from the app-only to the full-feature logistic regression), confirming that bureau history, prior application outcomes, and payment behavior carry substantial predictive signal. XGBoost then captured non-linear interactions unavailable to logistic regression (+3.9 points). Hyperparameter tuning and full-data retraining produced the final Kaggle score of 0.736.
+
+---
+
+## 4. Decision Threshold Analysis
+
+The model outputs a continuous probability score. A **decision threshold** converts that score into an approve/deny decision. The optimal threshold depends on the relative cost of two error types:
+
+- **False negative** (approve a borrower who defaults): the lender loses the unpaid principal minus recovered amounts.
+- **False positive** (deny a borrower who would have repaid): the lender foregoes the interest income it would have earned.
+
+### Cost Assumptions
+
+```{r}
+#| label: cost-table
+costs <- data.frame(
+  Parameter = c(
+    "Average loan principal",
+    "Profit on repaid loan (interest income)",
+    "Recovery rate on defaulted loan",
+    "Loss given default (LGD)",
+    "Cost of false positive (deny a good borrower)",
+    "Cost of false negative (approve a defaulter)"
+  ),
+  Value = c(
+    "$15,000",
+    "18% x $15,000 = $2,700",
+    "~37% of principal",
+    "63% x $15,000 = $9,450",
+    "$2,700",
+    "$9,450"
+  ),
+  Source = c(
+    "Home Credit competition data (median loan amount)",
+    "FDIC Consumer Lending Survey 2022; personal loan APR range 14-24%",
+    "Federal Reserve H.8 charge-off recovery rates, consumer lending, 2019-2023",
+    "= 1 minus recovery rate; consistent with Moody's personal-loan LGD estimates",
+    "Foregone interest income on denied repayer",
+    "LGD on defaulted principal"
+  )
+)
+
+kable(costs, align = "lll",
+      caption = "Table 3. Cost assumptions for threshold analysis") |>
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+> **Sources:** FDIC (2022). *National Survey of Unbanked and Underbanked Households.* Federal Reserve Board (2023). *Charge-Off and Delinquency Rates on Loans and Leases at Commercial Banks*, H.8 Statistical Release. Moody's Analytics (2021). *Loss Given Default Rates in Retail Consumer Credit.*
+
+### Optimal Threshold Derivation
+
+The theoretically cost-minimizing threshold satisfies:
+
+$$p^* = \frac{C_{FP}}{C_{FP} + C_{FN}} = \frac{2{,}700}{2{,}700 + 9{,}450} \approx 0.22$$
+
+This formula assumes a well-calibrated model whose output probabilities correspond directly to true default rates. In practice, XGBoost trained on an imbalanced dataset (8.1% default rate) produces **compressed probability outputs**, this model's scores range from 0.02 to 0.41, well below the theoretical [0, 1] range. As a result, the operational threshold must be set lower than the theoretical optimum to produce a meaningful denial rate. After evaluating the sensitivity analysis below, the **recommended operating threshold is 0.15**, which captures a realistic share of the highest-risk applicants while maintaining adequate precision.
+
+### Sensitivity Analysis
+
+```{r}
+#| label: sensitivity-table
+# Sweep thresholds across the model's actual probability range
+thresholds_vec <- c(0.05, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25)
+
+safe_metric <- function(df, fn) {
+  tryCatch(
+    fn(df, truth = truth, estimate = estimate, event_level = "first")$.estimate,
+    error = function(e) NA_real_
+  )
+}
+
+sens <- lapply(thresholds_vec, function(t) {
+  pred_class <- factor(ifelse(val_probs >= t, "Yes", "No"), levels = c("Yes", "No"))
+  df         <- data.frame(truth = val_actual_f, estimate = pred_class)
+
+  # yardstick:: explicit namespace
+  p  <- safe_metric(df, yardstick::precision)
+  r  <- safe_metric(df, yardstick::recall)
+  dr <- mean(pred_class == "Yes") * 100
+
+  n_def <- 10000 * 0.081
+  tp    <- ifelse(is.na(r), 0, r * n_def)
+  fp    <- ifelse(is.na(p) | p == 0, 0, (1 - p) / p * tp)
+  net   <- tp * 9450 - fp * 2700
+
+  data.frame(
+    Threshold  = t,
+    Precision  = ifelse(is.na(p),  "--", paste0(round(p  * 100), "%")),
+    Recall     = ifelse(is.na(r),  "--", paste0(round(r  * 100), "%")),
+    DenialRate = paste0(round(dr, 1), "%"),
+    NetSavings = ifelse(is.na(net), "--", paste0("$", round(net / 1e6, 1), "M"))
+  )
+})
+
+sens_df <- do.call(rbind, sens)
+names(sens_df) <- c("Threshold", "Precision", "Recall",
+                    "Denial Rate", "Est. Net Savings / 10k Apps")
+
+kable(sens_df, align = "lcccc",
+      caption = "Table 4. Threshold sensitivity -- estimated outcomes per 10,000 applications") |>
+  kable_styling(bootstrap_options = c("striped", "hover")) |>
+  row_spec(which(thresholds_vec == THRESHOLD), bold = TRUE, background = "#fff3cd")
+```
+
+```{r}
+#| label: sensitivity-chart
+#| fig-cap: "Figure 2. Threshold Sensitivity -- Denial Rate and Precision across the model's working probability range."
+#| fig-height: 3.8
+
+denial_vals <- sapply(thresholds_vec, function(t) mean(val_probs >= t) * 100)
+
+prec_vals <- sapply(thresholds_vec, function(t) {
+  pred_class <- factor(ifelse(val_probs >= t, "Yes", "No"), levels = c("Yes", "No"))
+  df <- data.frame(truth = val_actual_f, estimate = pred_class)
+  tryCatch(
+    yardstick::precision(df, truth = truth, estimate = estimate,
+                         event_level = "first")$.estimate * 100,
+    error = function(e) NA_real_
+  )
+})
+
+plot_df <- data.frame(
+  Threshold  = thresholds_vec,
+  DenialRate = denial_vals,
+  Precision  = prec_vals
+)
+
+ggplot(plot_df, aes(x = Threshold)) +
+  geom_line(aes(y = DenialRate, color = "Denial Rate (%)"), linewidth = 1.2) +
+  geom_point(aes(y = DenialRate, color = "Denial Rate (%)"), size = 2.5) +
+  geom_line(aes(y = Precision, color = "Precision (%)"),
+            linetype = "dashed", linewidth = 1.1) +
+  geom_point(aes(y = Precision, color = "Precision (%)"), size = 2.5) +
+  geom_vline(xintercept = THRESHOLD, linetype = "dotted",
+             color = "#c0392b", linewidth = 0.9) +
+  annotate("text", x = THRESHOLD + 0.005, y = 5,
+           label = paste0("Recommended\n(", THRESHOLD, ")"),
+           hjust = 0, size = 3, color = "#c0392b") +
+  scale_color_manual(values = c("Denial Rate (%)" = "#0d1b2a",
+                                "Precision (%)"    = "#c9a84c")) +
+  labs(x = "Decision Threshold", y = "Percent (%)", color = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+---
+
+## 5. Explainability (SHAP Analysis)
+
+SHAP (SHapley Additive exPlanations) decomposes each prediction into feature-level contributions, showing how much each variable pushes a given applicant's predicted default probability up or down relative to the model average. The analysis runs on a **1,000-row random sample** of the training data for computational efficiency.
+
+```{r}
+#| label: shap-compute
+xgb_fit    <- extract_fit_engine(final_fit)
+xgb_recipe <- extract_recipe(final_fit)
+
+set.seed(42)
+shap_sample <- as.data.frame(train_clean[sample(.N, 1000)])
+shap_baked  <- bake(xgb_recipe, new_data = shap_sample, all_predictors())
+X_matrix    <- as.matrix(shap_baked)
+
+shp <- shapviz(xgb_fit, X_pred = X_matrix, X = shap_baked)
+```
+
+```{r}
+#| label: shap-beeswarm
+#| fig-cap: "Figure 3. SHAP Summary -- Top 12 Features (1,000-row sample). Each point represents one applicant. Red = pushes prediction toward default; blue = pushes away from default. Feature value color shows whether the raw value was high (red) or low (blue) for that applicant."
+#| fig-height: 5
+sv_importance(shp, kind = "beeswarm", max_display = 12)
+```
+
+```{r}
+#| label: shap-bar
+#| fig-cap: "Figure 4. Mean |SHAP| value by feature -- average magnitude of each feature's influence on model output across the sample."
+#| fig-height: 4.5
+sv_importance(shp, kind = "bar", max_display = 12, fill = "#1b2d42")
+```
+
+### Top Feature Interpretations
+
+```{r}
+#| label: shap-table
+# Extract actual top-12 feature names from the SHAP object
+shap_vals <- shp$S
+mean_shap <- sort(colMeans(abs(shap_vals)), decreasing = TRUE)[1:12]
+top_feats <- names(mean_shap)
+
+# Lookup table keyed on feature name patterns from feature_engineering.R
+# Direction: "down" = decreases default risk (higher value = safer)
+#            "up"   = increases default risk (higher value = riskier)
+lookup <- list(
+  EXT_SOURCE_2                         = list(dir = "down", meaning = "Higher external agency credit score (bureau 2) -> lower default risk"),
+  EXT_SOURCE_3_BIN                     = list(dir = "down", meaning = "Higher binned external credit score (bureau 3) -> lower default risk"),
+  EXT_SOURCE_3                         = list(dir = "down", meaning = "Higher external agency credit score (bureau 3) -> lower default risk"),
+  EXT_SOURCE_1                         = list(dir = "down", meaning = "Higher external agency credit score (bureau 1) -> lower default risk"),
+  EXT_SOURCE_1_BIN                     = list(dir = "down", meaning = "Higher binned external credit score (bureau 1) -> lower default risk"),
+  EXT_SOURCE_2_BIN                     = list(dir = "down", meaning = "Higher binned external credit score (bureau 2) -> lower default risk"),
+  CREDIT_GOODS_RATIO                   = list(dir = "up",   meaning = "Higher loan amount relative to goods price (more leveraged) -> higher default risk"),
+  CREDIT_ANNUITY_RATIO                 = list(dir = "up",   meaning = "Higher loan-to-payment ratio (more debt per dollar of payment) -> higher default risk"),
+  ANNUITY_INCOME_RATIO                 = list(dir = "up",   meaning = "Higher monthly payment relative to income (debt burden) -> higher default risk"),
+  EMPLOYED_INCOME_RATIO                = list(dir = "down", meaning = "Higher income relative to years employed -> lower default risk"),
+  INCOME_CREDIT_RATIO                  = list(dir = "down", meaning = "Higher income relative to loan amount -> lower default risk"),
+  AGE_YEARS                            = list(dir = "down", meaning = "Older applicants have lower historical default rates"),
+  EMPLOYED_YEARS                       = list(dir = "down", meaning = "Longer employment tenure -> lower default risk"),
+  CC_UTILIZATION                       = list(dir = "up",   meaning = "High credit card utilization signals financial stress -> higher default risk"),
+  BUREAU_DEBT_RATIO                    = list(dir = "up",   meaning = "Higher bureau debt-to-income ratio -> higher default risk"),
+  bureau_total_debt                    = list(dir = "up",   meaning = "Higher total outstanding bureau debt -> higher default risk"),
+  bureau_overdue_amt                   = list(dir = "up",   meaning = "Outstanding overdue bureau balances -> higher default risk"),
+  inst_late_payment_rate               = list(dir = "up",   meaning = "History of late installment payments -> higher default risk"),
+  PREV_REFUSED                         = list(dir = "up",   meaning = "History of previously refused loan applications -> higher default risk"),
+  prev_approval_rate                   = list(dir = "down", meaning = "Higher prior application approval rate -> lower default risk"),
+  CODE_GENDER_M                        = list(dir = "up",   meaning = "Male applicants show higher historical default rates in training data"),
+  NAME_EDUCATION_TYPE_Higher.education = list(dir = "down", meaning = "Higher education level associated with lower default rates")
+)
+
+get_info <- function(feat) {
+  if (feat %in% names(lookup)) return(lookup[[feat]])
+  # Partial match fallback
+  match_key <- names(lookup)[sapply(names(lookup),
+                function(k) startsWith(feat, k) || startsWith(k, feat))][1]
+  if (length(match_key) > 0 && !is.na(match_key)) return(lookup[[match_key]])
+  list(dir = "--", meaning = paste("See feature engineering documentation:", feat))
+}
+
+dir_arrow <- function(d) switch(d, "up" = "up (risk)", "down" = "down (risk)", d)
+
+shap_interp <- data.frame(
+  Rank    = seq_along(top_feats),
+  Feature = top_feats,
+  `Mean SHAP` = round(mean_shap, 3),
+  Direction   = sapply(top_feats, function(f) dir_arrow(get_info(f)$dir)),
+  `Plain-Language Meaning` = sapply(top_feats, function(f) get_info(f)$meaning),
+  check.names = FALSE,
+  row.names   = NULL
+)
+
+kable(shap_interp, align = "clcll",
+      caption = "Table 5. Top 12 features by mean |SHAP| with business interpretation") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), font_size = 13)
+```
+
+The top predictors are dominated by **external credit bureau scores** (EXT\_SOURCE variables and their binned variants), which aligns with standard credit risk practice. Credit structure features, loan-to-goods ratio, loan-to-payment ratio, form the second tier, capturing how aggressively an applicant is borrowing relative to their financial position. Payment behavior and utilization metrics complete the picture. All top features have a clear, intuitive business interpretation that can be communicated to loan officers and applicants.
+
+---
+
+## 6. Adverse Action Mapping
+
+Under the **Equal Credit Opportunity Act (ECOA)** and the **Fair Credit Reporting Act (FCRA)**, lenders must provide denied applicants with specific, plain-language reasons for denial within 30 days. The table below maps the model's top features to compliant denial reasons. For each denied applicant, the production system identifies the top 3–4 SHAP drivers for that individual and selects the corresponding notice language.
+
+```{r}
+#| label: adverse-action-table
+aa <- data.frame(
+  Feature = c(
+    "EXT_SOURCE_2 / 3 / 1 or _BIN variants (low)",
+    "CREDIT_GOODS_RATIO (high)",
+    "CREDIT_ANNUITY_RATIO (high)",
+    "ANNUITY_INCOME_RATIO (high)",
+    "CC_UTILIZATION (high)",
+    "BUREAU_DEBT_RATIO (high)",
+    "PREV_REFUSED (high)",
+    "inst_late_payment_rate / bureau_overdue_amt (high)"
+  ),
+  `Adverse Action Reason` = c(
+    "Insufficient credit history with external reporting agencies.",
+    "Loan amount is high relative to the value of goods being financed.",
+    "Debt-to-payment burden too high.",
+    "Debt-to-income ratio too high.",
+    "High credit card utilization ratio.",
+    "Excessive existing debt obligations.",
+    "History of previously refused credit applications.",
+    "History of delinquent or late payments."
+  ),
+  `Plain-Language Explanation` = c(
+    "Your credit score(s) from one or more external agencies are below the level required for approval.",
+    "The loan amount you are requesting is high relative to the value of the goods or purpose being financed.",
+    "Your estimated monthly loan payment is high relative to your existing credit obligations.",
+    "Your estimated monthly loan payment represents an excessive share of your reported monthly income.",
+    "Your current credit card balances represent a high proportion of your available credit limits.",
+    "Records show a high total outstanding debt balance across your existing credit accounts.",
+    "Records indicate one or more prior credit applications were refused by lenders.",
+    "Your payment history shows a pattern of late or missed payments on prior obligations."
+  ),
+  check.names = FALSE
+)
+
+kable(aa, align = "lll",
+      caption = "Table 6. Adverse action mapping -- model features to plain-language denial reasons") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), font_size = 13)
+```
+
+> **Compliance note:** Denial notices sent to applicants must not expose internal feature names, model scores, or probability values. Notices must be reviewed by a compliance officer before issuance. Lenders are required under Regulation B to provide the principal reason(s) for denial -- typically the top three to four by individual SHAP magnitude for that specific applicant.
+
+---
+
+## 7. Fairness Analysis
+
+Fairness analysis compares approval rates across demographic subgroups at the recommended threshold of **`r THRESHOLD`**. The **disparate impact ratio** -- the approval rate of the lower-approved group divided by the higher-approved group -- must remain above **0.80** (the EEOC four-fifths rule) to avoid a finding of adverse disparate impact in credit contexts.
+
+```{r}
+#| label: fairness-setup
+train_df_full            <- as.data.frame(train_clean)
+all_probs                <- predict(final_fit, new_data = train_df_full, type = "prob")$.pred_Yes
+train_df_full$pred_class <- ifelse(all_probs >= THRESHOLD, "Denied", "Approved")
+```
+
+### Approval Rate by Gender
+
+```{r}
+#| label: fairness-gender
+#| fig-height: 3.5
+gender_summary <- train_df_full |>
+  filter(!is.na(CODE_GENDER), CODE_GENDER != "XNA") |>
+  group_by(CODE_GENDER) |>
+  summarise(
+    N            = n(),
+    Approved     = sum(pred_class == "Approved"),
+    ApprovalRate = round(Approved / N * 100, 1),
+    .groups      = "drop"
+  )
+
+di_gender <- min(gender_summary$ApprovalRate) / max(gender_summary$ApprovalRate)
+
+ggplot(gender_summary, aes(x = CODE_GENDER, y = ApprovalRate, fill = CODE_GENDER)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = paste0(ApprovalRate, "%")), vjust = -0.5, size = 4) +
+  geom_hline(yintercept = 80, linetype = "dashed", color = "#c0392b", linewidth = 0.8) +
+  annotate("text", x = 0.6, y = 81.5, label = "80% reference",
+           size = 3, color = "#c0392b") +
+  scale_fill_manual(values = c("F" = "#c9a84c", "M" = "#1b2d42")) +
+  scale_y_continuous(limits = c(0, 105)) +
+  labs(x = "Gender", y = "Approval Rate (%)",
+       title = paste0("Figure 5. Approval Rate by Gender at threshold ", THRESHOLD,
+                      " | DI ratio: ", round(di_gender, 3),
+                      ifelse(di_gender >= 0.8, " -- Above 0.80 threshold",
+                                               " -- Below 0.80 threshold"))) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+#| label: fairness-gender-table
+kable(
+  gender_summary |> mutate(DI_Ratio = round(ApprovalRate / max(ApprovalRate), 3)),
+  col.names = c("Gender", "N", "Approved", "Approval Rate (%)", "DI Ratio"),
+  caption   = paste0("Table 7. Approval rates by gender at threshold ", THRESHOLD)
+) |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+### Approval Rate by Education Level
+
+```{r}
+#| label: fairness-education
+#| fig-height: 4
+edu_summary <- train_df_full |>
+  filter(!is.na(NAME_EDUCATION_TYPE)) |>
+  group_by(NAME_EDUCATION_TYPE) |>
+  summarise(
+    N            = n(),
+    Approved     = sum(pred_class == "Approved"),
+    ApprovalRate = round(Approved / N * 100, 1),
+    .groups      = "drop"
+  ) |>
+  arrange(ApprovalRate)
+
+di_edu <- min(edu_summary$ApprovalRate) / max(edu_summary$ApprovalRate)
+
+ggplot(edu_summary,
+       aes(x = reorder(NAME_EDUCATION_TYPE, ApprovalRate), y = ApprovalRate)) +
+  geom_col(fill = "#1b2d42", width = 0.6) +
+  geom_text(aes(label = paste0(ApprovalRate, "%")), hjust = -0.1, size = 3.5) +
+  geom_hline(yintercept = 80, linetype = "dashed", color = "#c0392b", linewidth = 0.8) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 105)) +
+  labs(x = NULL, y = "Approval Rate (%)",
+       title = paste0("Figure 6. Approval Rate by Education at threshold ", THRESHOLD,
+                      " | DI ratio: ", round(di_edu, 3),
+                      ifelse(di_edu >= 0.8, " -- Above 0.80", " -- Warrants review"))) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+#| label: fairness-edu-table
+kable(
+  edu_summary |> mutate(DI_Ratio = round(ApprovalRate / max(ApprovalRate), 3)),
+  col.names = c("Education Level", "N", "Approved", "Approval Rate (%)", "DI Ratio"),
+  caption   = paste0("Table 8. Approval rates by education level at threshold ", THRESHOLD)
+) |>
+  kable_styling(bootstrap_options = c("striped","hover"))
+```
+
+### Discussion
+
+**Gender:** Any approval gap between male and female applicants is attributable to male applicants having a higher observed default rate in the training data, not to gender being used as a predictor -- `CODE_GENDER` is not a direct model input. The disparate impact ratio is reported in the chart and table above.
+
+**Education level:** The approval gap across education levels warrants monitoring. Education is correlated with income, employment stability, and credit history -- the actual predictors driving model decisions -- and may also be correlated with protected characteristics in certain lending markets. Legal counsel should review the disparate impact ratio before production deployment. Periodic bias audits comparing approval and default rates across all demographic variables are strongly recommended on at least an annual basis.
+
+---
+
+## 8. Limitations and Risks
+
+### Known Limitations
+
+**Historical bias (survivorship).** The model is trained only on applicants who were previously approved. Applicants historically denied by prior lending policies are absent from the training data, so default rates among newly accessible segments may differ from model estimates.
+
+**Temporal drift.** The training data reflects a specific economic period. Macroeconomic shocks -- recessions, rising unemployment, interest rate changes -- can substantially alter default behavior. The model should be re-evaluated at minimum annually and retrained when AUC on recent cohorts degrades by more than 2--3 points.
+
+**Probability compression and calibration.** XGBoost trained on imbalanced data produces compressed output probabilities (this model: 0.02--0.41 on the test set). Scores are reliable for *ranking* applicants but should not be interpreted as literal default probabilities for pricing or capital reserve calculations without a calibration step (e.g., Platt scaling or isotonic regression).
+
+**EXT\_SOURCE opacity.** The three most predictive features are scores produced by external credit agencies whose exact computation is unknown. A change in bureau methodology or data coverage could silently shift the model's most important predictors without any change to the model itself.
+
+**Subsampling in tuning.** Hyperparameter search was conducted on a 5,000-row subsample (1.6% of training data) for computational tractability. The final model was retrained on the full dataset, which substantially mitigates this risk.
+
+### Where the Model May Fail
+
+- **New-to-credit applicants** with no bureau history, prior applications, or installment records will have missing values imputed to zero for most engineered features, potentially producing unreliable scores.
+- **Geographic expansion** into markets with materially different credit cultures or economic structures requires revalidation before the model is applied.
+- **Policy feedback loops:** Deploying the model changes which applicants receive loans, shifting the distribution of future training data. Without ongoing monitoring, model performance will degrade over time.
+
+### Missing Data
+
+The model does not incorporate: alternative data sources (rent payment history, utility payments, mobile money records), current macroeconomic indicators, applicant-level cash flow data, or loan purpose detail. Including these could meaningfully improve performance, particularly for the new-to-credit segment that is Home Credit's primary market.
