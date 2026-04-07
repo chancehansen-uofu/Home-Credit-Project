@@ -313,16 +313,16 @@ fwrite(test_clean,  "test_features.csv")
 ## FAQ
 
 **Q: What was your approach to feature engineering?**
-- A: I joined 7 relational tables and engineered 50+ features from scratch creating financial ratios like DTI and LTV, behavioral aggregations from payment history, missing value indicators, and interaction terms. The critical discipline was computing all statistics from training data only and applying them identically to the test set. That constraint forces you to think carefully about every transformation, and it's the difference between a model that generalizes and one that just looks good in development.
+- I joined 7 relational tables and engineered 50+ features from scratch creating financial ratios like DTI and LTV, behavioral aggregations from payment history, missing value indicators, and interaction terms. The critical discipline was computing all statistics from training data only and applying them identically to the test set. That constraint forces you to think carefully about every transformation, and it's the difference between a model that generalizes and one that just looks good in development.
 
 **Q: Why did you choose XGBoost over the other algorithms?**
-- A: Logistic regression plateaued around 0.675 AUC even with rich features because it cannot capture non-linear interactions without explicit polynomial terms. Random forest (0.667) underperformed XGBoost (0.714) because the boosting framework iteratively corrects residual errors, which is particularly powerful on noisy, imbalanced data. XGBoost also handles missing values natively and trains in seconds at 300K rows. Those practical advantages matter in actual production.
+- Logistic regression plateaued around 0.675 AUC even with rich features because it cannot capture non-linear interactions without explicit polynomial terms. Random forest (0.667) underperformed XGBoost (0.714) because the boosting framework iteratively corrects residual errors, which is particularly powerful on noisy, imbalanced data. XGBoost also handles missing values natively and trains in seconds at 300K rows. Those practical advantages matter in actual production.
 
 **Q: How did you handle class imbalance?**
-- A: I tested SMOTE but found it reduced AUC from 0.675 to 0.658 for logistic regression and from 0.714 to 0.708 for XGBoost. SMOTE optimizes minority-class recall, not AUC ranking quality, and those objectives don't always align. I ultimately used XGBoost's `scale_pos_weight` parameter to implicitly up-weight the minority class during training, which proved more effective.
+- I tested SMOTE but found it reduced AUC from 0.675 to 0.658 for logistic regression and from 0.714 to 0.708 for XGBoost. SMOTE optimizes minority-class recall, not AUC ranking quality, and those objectives don't always align. I ultimately used XGBoost's `scale_pos_weight` parameter to implicitly up-weight the minority class during training, which proved more effective.
 
 **Q: What would you do with more time?**
-- A: I'd explore LightGBM or CatBoost, run a broader hyperparameter search, and invest more systematically in feature selection to reduce noise. I'd also deepen the fairness analysis in the model card as I've learned that credit models can encode demographic bias in subtle ways, and that has both ethical and regulatory implications worth understanding before deployment.
+- I'd explore LightGBM or CatBoost, run a broader hyperparameter search, and invest more systematically in feature selection to reduce noise. I'd also deepen the fairness analysis in the model card as I've learned that credit models can encode demographic bias in subtle ways, and that has both ethical and regulatory implications worth understanding before deployment.
 
 ---
 
