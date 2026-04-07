@@ -52,7 +52,7 @@ I built an end-to-end machine learning pipeline in R that:
 4. **Selected a tuned XGBoost model** as the champion, trained on the full 307,511-row training set
 5. **Submitted predictions** for 48,744 test applicants to Kaggle, achieving a public leaderboard AUC of **0.73592**
 
-The final model outputs a default probability for each applicant. In a real deployment, this score would drive underwriting decisions — approving, declining, or flagging applications for manual review based on a business-optimized probability threshold.
+The final model outputs a default probability for each applicant. In a real deployment, this score would drive underwriting decisions, such as approving, declining, or flagging applications for manual review based on a business-optimized probability threshold.
 
 ### Group Project
 
@@ -72,13 +72,13 @@ A well-calibrated default prediction model delivers value across multiple dimens
 The model identifies high-risk applicants before a loan is made. Even modest improvement in default detection translates to millions of dollars in avoided losses across a portfolio of 300,000+ loans.
 
 **More Inclusive Lending**
-By using alternative data (payment history, bureau records, transactional behavior) rather than traditional credit scores alone, the model helps extend credit to creditworthy borrowers who would otherwise be rejected. This expands the customer base while managing risk responsibly — exactly Home Credit's mission.
+By using alternative data (payment history, bureau records, transactional behavior) rather than traditional credit scores alone, the model helps extend credit to creditworthy borrowers who would otherwise be rejected. This expands the customer base while managing risk responsibly which was the Home Credit's mission.
 
 **Faster, More Consistent Decisions**
 An automated scoring model makes decisions in milliseconds, at any volume, with no variation due to human judgment or fatigue. This reduces the cost per application and enables scalable lending operations.
 
 **Regulatory Defensibility**
-The model card documents performance, limitations, and fairness considerations — providing an audit trail for regulatory review and enabling adverse action reasons to be communicated to declined applicants in compliance with ECOA and FCRA requirements.
+The model card documents performance, limitations, and fairness considerations, which provides an audit trail for regulatory review and enabling adverse action reasons to be communicated to declined applicants in compliance with ECOA and FCRA requirements.
 
 ---
 
@@ -94,7 +94,6 @@ The model card documents performance, limitations, and fairness considerations �
 | XGBoost — base configuration | 0.714 |
 | XGBoost + SMOTE | 0.708 |
 | **XGBoost — tuned (20-iteration search)** | **0.726** |
-| **Kaggle Public Leaderboard** | **0.73592** |
 
 **Final model hyperparameters** (selected via space-filling search):
 
@@ -106,10 +105,10 @@ The model card documents performance, limitations, and fairness considerations �
 ## Challenges Encountered
 
 **1. Data Scale and Complexity**
-The dataset spans 7 relational tables with hundreds of raw variables and over 300,000 records. Joining and aggregating this data — especially the bureau, installment, and credit card tables — required careful thinking about aggregation logic and memory efficiency in R.
+The dataset spans 7 relational tables with hundreds of raw variables and over 300,000 records. Joining and aggregating this data (especially the bureau, installment, and credit card tables) required careful thinking and planning about aggregation logic and memory efficiency in R.
 
 **2. Preventing Data Leakage**
-A subtle but critical challenge: any preprocessing statistic (median, min/max, bin threshold) computed on the combined train+test set leaks future information into the training process, inflating apparent model performance. Designing the pipeline to compute all parameters from training data only — and apply them consistently to test data — required disciplined engineering and careful code architecture.
+A subtle but critical challenge: any preprocessing statistic (median, min/max, bin threshold) computed on the combined train+test set leaks future information into the training process, inflating apparent model performance. Designing the pipeline to compute all parameters from training data only (and apply them consistently to test data) required disciplined engineering and careful code architecture.
 
 **3. Class Imbalance**
 Only about 8% of applicants in the training set defaulted. This imbalance causes naive models to simply predict "no default" for everyone, achieving 92% accuracy while being completely useless for the business. We tested SMOTE oversampling but found it actually reduced AUC, ultimately relying on XGBoost's built-in `scale_pos_weight` parameter instead.
@@ -124,15 +123,15 @@ With 50+ engineered features, there was risk of overfitting to noise. Balancing 
 
 ## What I Learned
 
-**Feature engineering matters more than algorithm choice.** Adding engineered features lifted logistic regression AUC from 0.633 to 0.675 — a +4.2 point gain — without changing the algorithm at all. No amount of hyperparameter tuning on weak inputs can substitute for better features.
+**Feature engineering matters more than algorithm choice.** Adding engineered features lifted logistic regression AUC from 0.633 to 0.675 (a +4.2 point gain) without changing the algorithm at all. No amount of hyperparameter tuning on weak inputs can substitute for better features.
 
-**Gradient boosting is exceptionally well-suited to tabular, imbalanced data.** XGBoost's sequential error-correction, native missing value handling, and built-in regularization gave it a decisive edge over both logistic regression and random forest. Understanding *why* a method works — not just *that* it works — is essential for explaining modeling decisions to stakeholders.
+**Gradient boosting is exceptionally well-suited to tabular, imbalanced data.** XGBoost's sequential error-correction, native missing value handling, and built-in regularization gave it a decisive edge over both logistic regression and random forest. Understanding *why* a method works not just *that* it works is essential for explaining modeling decisions to stakeholders.
 
-**Empirical validation beats intuition.** I expected SMOTE to help given the severe class imbalance. It didn't — it hurt AUC for both logistic regression and XGBoost. The lesson: always validate your assumptions, because common intuitions don't always hold on a given dataset.
+**Empirical validation beats intuition.** I expected SMOTE to help given the severe class imbalance. It didn't, it actually hurt AUC for both logistic regression and XGBoost. The lesson: always validate your assumptions, because common intuitions don't always hold on a given dataset.
 
-**Reproducible pipelines are non-negotiable.** Designing a pipeline where all parameters flow cleanly from training data to test data — with no manual steps or ad hoc fixes — was more work upfront but made iteration far faster and the final results trustworthy and auditable.
+**Reproducible pipelines are non-negotiable.** Designing a pipeline where all parameters flow cleanly from training data to test data with no manual steps or ad hoc fixes was more work upfront but made iteration far faster and the final results trustworthy and auditable.
 
-**Data science is communication.** A model that produces great predictions but cannot be explained to a business stakeholder or regulator has limited real-world value. Writing the model card forced me to think about how the model would actually be used, by whom, and what could go wrong — skills I developed through years of translating analytics into marketing strategy.
+**Data science is communication.** A model that produces great predictions but cannot be explained to a business stakeholder or regulator has limited real-world value. Writing the model card forced me to think about how the model would actually be used, by whom, and what could go wrong.
 
 ---
 
@@ -144,12 +143,12 @@ There were two major elements to this project that lead to the success, **featur
 
 I built a fully modular, reusable R script that transforms raw Home Credit data into a model-ready feature set. Key contributions include:
 
-- **Financial ratios:** Debt-to-income (DTI), credit-to-income, loan-to-value (LTV), and payment-to-annuity ratios — variables that directly capture a borrower's financial burden
-- **Demographic features:** Age in years (converted from days), employment duration, derived age groups and income brackets
-- **Bureau aggregations:** Loan counts, active vs. closed loans, overdue debt amounts, and credit utilization from external bureau records
-- **Behavioral features:** Late payment rates, overpayment trends, and installment payment consistency derived from transaction history
-- **Missing value indicators:** Strategic binary flags for missingness patterns, which themselves carry predictive signal (e.g., applicants without external credit scores)
-- **Train/test consistency:** All imputation parameters (medians, bin thresholds) are computed from training data only and applied identically to the test set, **preventing data leakage**
+- **Financial ratios:** Debt-to-income (DTI), credit-to-income, loan-to-value (LTV), and payment-to-annuity ratios. All variables that directly capture a borrower's financial burden.
+- **Demographic features:** Age in years (converted from days), employment duration, derived age groups and income brackets.
+- **Bureau aggregations:** Loan counts, active vs. closed loans, overdue debt amounts, and credit utilization from external bureau records.
+- **Behavioral features:** Late payment rates, overpayment trends, and installment payment consistency derived from transaction history.
+- **Missing value indicators:** Strategic binary flags for missingness patterns, which themselves carry predictive signal (e.g., applicants without external credit scores).
+- **Train/test consistency:** All imputation parameters (medians, bin thresholds) are computed from training data only and applied identically to the test set, **preventing data leakage**.
 
 ### Predictive Modeling (`Modeling_HansenChance.qmd`)
 
@@ -162,7 +161,7 @@ I designed and ran a systematic model comparison and tuning workflow:
 
 ### Model Card (`ModelCard_HansenChance.qmd`)
 
-I documented the final model's intended use cases, performance characteristics, limitations, and fairness considerations in a structured model card — following industry best practices for responsible AI deployment.
+I documented the final model's intended use cases, performance characteristics, limitations, and fairness considerations in a structured model card.
 
 ---
 
@@ -195,7 +194,7 @@ Six model configurations were evaluated using 3-fold cross-validation AUC on a s
 
 ### Key Findings
 
-**Feature engineering provided the largest single performance gain.** Adding bureau history, previous application outcomes, installment payment behavior, credit card utilization, and POS cash features lifted logistic regression AUC from 0.633 to 0.675 — a 4.2-point improvement before changing algorithms at all.
+**Feature engineering provided the largest single performance gain.** Adding bureau history, previous application outcomes, installment payment behavior, credit card utilization, and POS cash features lifted logistic regression AUC from 0.633 to 0.675; a 4.2-point improvement before changing algorithms at all.
 
 **XGBoost outperformed all other algorithms.** Its ability to model non-linear interactions, handle missing values natively, and build sequentially corrective ensembles gave it a clear edge over both logistic regression and random forest on this dataset.
 
@@ -314,17 +313,17 @@ fwrite(test_clean,  "test_features.csv")
 ## FAQ
 
 **"What was your approach to feature engineering."**
-I joined 7 relational tables and engineered 50+ features from scratch — financial ratios like DTI and LTV, behavioral aggregations from payment history, missing value indicators, and interaction terms. The critical discipline was computing all statistics from training data only and applying them identically to the test set. That constraint forces you to think carefully about every transformation, and it's the difference between a model that generalizes and one that just looks good in development.
+I joined 7 relational tables and engineered 50+ features from scratch creating financial ratios like DTI and LTV, behavioral aggregations from payment history, missing value indicators, and interaction terms. The critical discipline was computing all statistics from training data only and applying them identically to the test set. That constraint forces you to think carefully about every transformation, and it's the difference between a model that generalizes and one that just looks good in development.
 
 **"Why did you choose XGBoost over the other algorithms?"**
-Logistic regression plateaued around 0.675 AUC even with rich features because it cannot capture non-linear interactions without explicit polynomial terms. Random forest (0.667) underperformed XGBoost (0.714) because the boosting framework iteratively corrects residual errors — particularly powerful on noisy, imbalanced data. XGBoost also handles missing values natively and trains in seconds at 300K rows. Those practical advantages matter in production.
+Logistic regression plateaued around 0.675 AUC even with rich features because it cannot capture non-linear interactions without explicit polynomial terms. Random forest (0.667) underperformed XGBoost (0.714) because the boosting framework iteratively corrects residual errors, which is particularly powerful on noisy, imbalanced data. XGBoost also handles missing values natively and trains in seconds at 300K rows. Those practical advantages matter in actual production.
 
 **"How did you handle class imbalance?"**
-I tested SMOTE but found it reduced AUC — from 0.675 to 0.658 for logistic regression and from 0.714 to 0.708 for XGBoost. SMOTE optimizes minority-class recall, not AUC ranking quality, and those objectives don't always align. I ultimately used XGBoost's `scale_pos_weight` parameter to implicitly up-weight the minority class during training, which proved more effective.
+I tested SMOTE but found it reduced AUC from 0.675 to 0.658 for logistic regression and from 0.714 to 0.708 for XGBoost. SMOTE optimizes minority-class recall, not AUC ranking quality, and those objectives don't always align. I ultimately used XGBoost's `scale_pos_weight` parameter to implicitly up-weight the minority class during training, which proved more effective.
 
 **"What would you do with more time?"**
 I'd explore LightGBM or CatBoost, run a broader hyperparameter search, and invest more systematically in feature selection to reduce noise. I'd also deepen the fairness analysis in the model card — credit models can encode demographic bias in subtle ways, and that has both ethical and regulatory implications worth understanding before deployment.
 
 ---
 
-*This project was completed as part of IS 6850 — Business Analytics Practicum, David Eccles School of Business, University of Utah.*
+*This project was completed as part of IS 6850 — Business Analytics Capstone 1, David Eccles School of Business, University of Utah.*
