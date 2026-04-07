@@ -322,7 +322,7 @@ fwrite(test_clean,  "test_features.csv")
 - A: I tested SMOTE but found it reduced AUC from 0.675 to 0.658 for logistic regression and from 0.714 to 0.708 for XGBoost. SMOTE optimizes minority-class recall, not AUC ranking quality, and those objectives don't always align. I ultimately used XGBoost's `scale_pos_weight` parameter to implicitly up-weight the minority class during training, which proved more effective.
 
 **Q: What would you do with more time?**
-- A: I'd explore LightGBM or CatBoost, run a broader hyperparameter search, and invest more systematically in feature selection to reduce noise. I'd also deepen the fairness analysis in the model card — credit models can encode demographic bias in subtle ways, and that has both ethical and regulatory implications worth understanding before deployment.
+- A: I'd explore LightGBM or CatBoost, run a broader hyperparameter search, and invest more systematically in feature selection to reduce noise. I'd also deepen the fairness analysis in the model card as I've learned that credit models can encode demographic bias in subtle ways, and that has both ethical and regulatory implications worth understanding before deployment.
 
 ---
 
